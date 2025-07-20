@@ -23,10 +23,37 @@ class CategorySerializer(serializers.ModelSerializer):
 
 
 class LocationSerializer(serializers.ModelSerializer):
-    """Location serializer"""
+    """Serializer for Location model"""
     class Meta:
         model = Location
         fields = ['id', 'name', 'city', 'state', 'country', 'latitude', 'longitude']
+    
+    def to_representation(self, instance):
+        """Custom representation for better display"""
+        data = super().to_representation(instance)
+        data['display_name'] = str(instance)
+        return data
+
+
+class HostSerializer(serializers.ModelSerializer):
+    """Serializer for User as host"""
+    full_name = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = User
+        fields = ['id', 'username', 'first_name', 'last_name', 'full_name']
+    
+    def get_full_name(self, obj):
+        return obj.get_full_name() or obj.username
+
+
+class ReviewSummarySerializer(serializers.ModelSerializer):
+    """Serializer for Review summary (for listing detail)"""
+    user_name = serializers.CharField(source='user.username', read_only=True)
+    
+    class Meta:
+        model = Review
+        fields = ['id', 'user_name', 'rating', 'title', 'content', 'created_at', 'is_verified']
 
 
 class ListingImageSerializer(serializers.ModelSerializer):
@@ -35,6 +62,152 @@ class ListingImageSerializer(serializers.ModelSerializer):
         model = ListingImage
         fields = ['id', 'image', 'caption', 'order']
         read_only_fields = ['id']
+
+
+class ListingSerializer(serializers.ModelSerializer):
+    """
+    Main serializer for Listing model with nested relationships
+    """
+    # Nested serializers for read operations
+    category = CategorySerializer(read_only=True)
+    location = LocationSerializer(read_only=True)
+    host = HostSerializer(read_only=True)
+    images = ListingImageSerializer(many=True, read_only=True)
+    
+    # Write-only fields for relationships
+    category_id = serializers.IntegerField(write_only=True)
+    location_id = serializers.IntegerField(write_only=True)
+    
+    # Computed fields
+    amenities_list = serializers.SerializerMethodField()
+    average_rating = serializers.SerializerMethodField()
+    review_count = serializers.SerializerMethodField()
+    image_count = serializers.SerializerMethodField()
+    
+    # Recent reviews (optional, can be excluded for list views)
+    recent_reviews = ReviewSummarySerializer(
+        source='reviews', 
+        many=True, 
+        read_only=True
+    )
+    
+    class Meta:
+        model = Listing
+        fields = [
+            # Basic fields
+            'id', 'title', 'description', 'listing_type', 'status',
+            'price_per_night', 'currency', 'max_guests', 'bedrooms', 'bathrooms',
+            'amenities', 'amenities_list', 'house_rules', 'is_available',
+            'minimum_stay', 'maximum_stay', 'main_image', 'slug', 'view_count',
+            'created_at', 'updated_at',
+            
+            # Relationships (read)
+            'category', 'location', 'host', 'images',
+            
+            # Relationships (write)
+            'category_id', 'location_id',
+            
+            # Computed fields
+            'average_rating', 'review_count', 'image_count',
+            
+            # Optional nested data
+            'recent_reviews',
+        ]
+        read_only_fields = ['id', 'slug', 'view_count', 'created_at', 'updated_at', 'host']
+        extra_kwargs = {
+            'price_per_night': {'min_value': 0},
+            'max_guests': {'min_value': 1},
+            'bedrooms': {'min_value': 0},
+            'bathrooms': {'min_value': 0},
+            'minimum_stay': {'min_value': 1},
+        }
+    
+    def get_amenities_list(self, obj):
+        """Return amenities as a list"""
+        return obj.get_amenities_list()
+    
+    def get_average_rating(self, obj):
+        """Calculate average rating from reviews"""
+        reviews = obj.reviews.filter(is_verified=True)
+        if reviews.exists():
+            total_rating = sum(review.rating for review in reviews)
+            return round(total_rating / reviews.count(), 1)
+        return None
+    
+    def get_review_count(self, obj):
+        """Get total number of verified reviews"""
+        return obj.reviews.filter(is_verified=True).count()
+    
+    def get_image_count(self, obj):
+        """Get total number of images (including main image)"""
+        count = obj.images.count()
+        if obj.main_image:
+            count += 1
+        return count
+    
+    def validate(self, data):
+        """Custom validation"""
+        # Validate minimum/maximum stay
+        minimum_stay = data.get('minimum_stay', 1)
+        maximum_stay = data.get('maximum_stay')
+        
+        if maximum_stay and minimum_stay > maximum_stay:
+            raise serializers.ValidationError(
+                "Minimum stay cannot be greater than maximum stay"
+            )
+        
+        # Validate guests vs bedrooms (optional business rule)
+        max_guests = data.get('max_guests', 1)
+        bedrooms = data.get('bedrooms', 1)
+        
+        if max_guests > bedrooms * 4:  # Assuming max 4 guests per bedroom
+            raise serializers.ValidationError(
+                "Maximum guests seems too high for the number of bedrooms"
+            )
+        
+        return data
+    
+    def create(self, validated_data):
+        """Create listing with current user as host"""
+        validated_data['host'] = self.context['request'].user
+        return super().create(validated_data)
+    
+    def to_representation(self, instance):
+        """Customize representation based on context"""
+        data = super().to_representation(instance)
+        
+        # Remove recent_reviews for list views to reduce payload
+        if self.context.get('view_type') == 'list':
+            data.pop('recent_reviews', None)
+        else:
+            # Limit recent reviews to last 5 for detail view
+            if 'recent_reviews' in data and data['recent_reviews']:
+                data['recent_reviews'] = data['recent_reviews'][:5]
+        
+        # Add computed display fields
+        data['price_display'] = f"{data['currency']} {data['price_per_night']}"
+        data['capacity_display'] = f"{data['max_guests']} guests • {data['bedrooms']} bedrooms • {data['bathrooms']} bathrooms"
+        
+        return data
+
+
+class ListingListSerializer(ListingSerializer):
+    """
+    Simplified serializer for listing lists (excludes heavy nested data)
+    """
+    class Meta(ListingSerializer.Meta):
+        fields = [
+            'id', 'title', 'listing_type', 'status', 'price_per_night', 'currency',
+            'max_guests', 'bedrooms', 'bathrooms', 'main_image', 'slug',
+            'is_available', 'minimum_stay', 'created_at',
+            'category', 'location', 'average_rating', 'review_count', 'image_count'
+        ]
+    
+    def to_representation(self, instance):
+        """Simplified representation for lists"""
+        self.context['view_type'] = 'list'
+        return super().to_representation(instance)
+
 
 
 class ReviewSerializer(serializers.ModelSerializer):
@@ -50,7 +223,7 @@ class ReviewSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'user', 'is_verified', 'created_at', 'updated_at']
 
 
-class ListingListSerializer(serializers.ModelSerializer):
+class ListingListAndReviewsSerializer(serializers.ModelSerializer):
     """Lightweight serializer for listing lists"""
     category = CategorySerializer(read_only=True)
     location = LocationSerializer(read_only=True)
